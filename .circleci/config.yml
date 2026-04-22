@@ -23,7 +23,7 @@ executors:
     working_directory: ~/project
     environment:
       TG_ENV: << pipeline.parameters.environment >>
-      AWS_DEFAULT_REGION: us-west-2
+      AWS_DEFAULT_REGION: ap-south-1
 
 # ──────────────────────────────────────────────────────────────────────────────
 # REUSABLE COMMANDS
