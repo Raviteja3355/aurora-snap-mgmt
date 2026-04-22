@@ -360,7 +360,7 @@ Every taggable resource receives these tags automatically:
 | `created_by_name` | IAM username extracted from the ARN |
 | `created_date` | Date of apply (`YYYY-MM-DD`) |
 
----
+----
 
 ## Destroying Infrastructure
 
