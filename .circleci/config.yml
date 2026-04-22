@@ -2,19 +2,26 @@ version: 2.1
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PIPELINE PARAMETERS
-# When you trigger via "Run Pipeline" in the CircleCI UI, set `environment`
-# to the target env (e.g. qa, prod).  Defaults to "qa".
+# Trigger via CircleCI UI → "Run Pipeline" → Add Parameters:
+#   environment : qa | stg | prod  (default: qa)
+#   action      : deploy | destroy  (default: deploy)
+#
+# A normal git push always runs the deploy workflow (action defaults to deploy).
+# To destroy, trigger manually with action=destroy.
 # ──────────────────────────────────────────────────────────────────────────────
 parameters:
   environment:
     type: string
     default: "qa"
     description: "Target environment – must match a file in environments/<env>.tfvars"
+  action:
+    type: enum
+    enum: ["deploy", "destroy"]
+    default: "deploy"
+    description: "deploy = provision resources | destroy = tear down all resources"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EXECUTOR
-# alpine/terragrunt ships Terraform + Terragrunt on Alpine Linux.
-# Pin the tag to the Terragrunt version your team uses, e.g. alpine/terragrunt:0.58.14
 # ──────────────────────────────────────────────────────────────────────────────
 executors:
   terragrunt:
@@ -52,9 +59,8 @@ commands:
 jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
-  # STAGE 1 · upload-tfvars
+  # upload-tfvars
   # Uploads environments/<env>.tfvars from the repo to the S3 config bucket.
-  # This job runs only after the "approve-upload-tfvars" manual gate is clicked.
   # ────────────────────────────────────────────────────────────────────────────
   upload-tfvars:
     executor: terragrunt
@@ -67,8 +73,6 @@ jobs:
             ENV="<< pipeline.parameters.environment >>"
             LOCAL="environments/${ENV}.tfvars"
 
-            # Read config_bucket and config_prefix directly from backend/backend.hcl
-            # so this step is always in sync with what terragrunt expects to find.
             CONFIG_BUCKET=$(grep 'config_bucket' backend/backend.hcl | sed 's/.*=\s*"\(.*\)".*/\1/')
             CONFIG_PREFIX=$(grep 'config_prefix' backend/backend.hcl | sed 's/.*=\s*"\(.*\)".*/\1/')
             S3="s3://${CONFIG_BUCKET}/${CONFIG_PREFIX}/${ENV}.tfvars"
@@ -84,10 +88,9 @@ jobs:
             echo "Upload complete."
 
   # ────────────────────────────────────────────────────────────────────────────
-  # STAGE 2 · init
-  # Initialises Terragrunt/Terraform and caches providers + modules.
-  # The .terragrunt-cache directory is persisted to the workspace so later
-  # jobs skip the provider download.
+  # init
+  # Initialises Terragrunt/Terraform. Reused by both deploy and destroy
+  # workflows. Persists .terragrunt-cache to workspace for downstream jobs.
   # ────────────────────────────────────────────────────────────────────────────
   init:
     executor: terragrunt
@@ -105,9 +108,8 @@ jobs:
             - .terragrunt-cache
 
   # ────────────────────────────────────────────────────────────────────────────
-  # STAGE 3 · plan
-  # Runs terragrunt plan and saves the output as a build artifact so you can
-  # review it in the CircleCI UI before approving the apply gate.
+  # plan
+  # Saves full plan output as a build artifact for review before apply.
   # ────────────────────────────────────────────────────────────────────────────
   plan:
     executor: terragrunt
@@ -132,9 +134,8 @@ jobs:
             - .terragrunt-cache
 
   # ────────────────────────────────────────────────────────────────────────────
-  # STAGE 4 · apply
-  # Runs only after the "approve-apply" manual gate is clicked.
-  # Review the plan-output.txt artifact from the plan job first!
+  # apply
+  # Runs only after the approve-apply manual gate is clicked.
   # ────────────────────────────────────────────────────────────────────────────
   apply:
     executor: terragrunt
@@ -153,11 +154,32 @@ jobs:
           command: terragrunt output || true
           when: on_success
 
+  # ────────────────────────────────────────────────────────────────────────────
+  # destroy
+  # Tears down ALL resources in the target environment.
+  # Only runs after the approve-destroy manual gate is clicked.
+  # Triggered by: Run Pipeline → action=destroy
+  # ────────────────────────────────────────────────────────────────────────────
+  destroy:
+    executor: terragrunt
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/project
+      - verify_aws
+      - run:
+          name: "Terragrunt Destroy – << pipeline.parameters.environment >>"
+          command: |
+            mkdir -p .tfvars-cache
+            echo "WARNING: About to destroy ALL resources in environment: << pipeline.parameters.environment >>"
+            terragrunt destroy -auto-approve
+
 # ──────────────────────────────────────────────────────────────────────────────
-# WORKFLOW
+# WORKFLOWS
 #
+# DEPLOY (action=deploy — default on every git push)
 # ┌─────────────────────────┐
-# │ 1. approve-upload-tfvars│  ← MANUAL GATE (click Approve in CircleCI)
+# │ 1. approve-upload-tfvars│  ← MANUAL GATE
 # └────────────┬────────────┘
 #              ▼
 # ┌─────────────────────────┐
@@ -179,11 +201,26 @@ jobs:
 # ┌─────────────────────────┐
 # │ 6. apply                │  terragrunt apply -auto-approve
 # └─────────────────────────┘
+#
+# DESTROY (action=destroy — only when triggered manually via CircleCI UI)
+# ┌─────────────────────────┐
+# │ 1. approve-destroy      │  ← MANUAL GATE (confirm you want to destroy)
+# └────────────┬────────────┘
+#              ▼
+# ┌─────────────────────────┐
+# │ 2. init                 │  terragrunt init (sets up providers + backend)
+# └────────────┬────────────┘
+#              ▼
+# ┌─────────────────────────┐
+# │ 3. destroy              │  terragrunt destroy -auto-approve
+# └─────────────────────────┘
 # ──────────────────────────────────────────────────────────────────────────────
 workflows:
+
   deploy:
+    when:
+      equal: [deploy, << pipeline.parameters.action >>]
     jobs:
-      # Gate 1 – approve before touching S3 tfvars
       - approve-upload-tfvars:
           type: approval
 
@@ -199,7 +236,6 @@ workflows:
           requires:
             - init
 
-      # Gate 2 – approve after reviewing plan output artifact
       - approve-apply:
           type: approval
           requires:
@@ -208,3 +244,18 @@ workflows:
       - apply:
           requires:
             - approve-apply
+
+  destroy:
+    when:
+      equal: [destroy, << pipeline.parameters.action >>]
+    jobs:
+      - approve-destroy:
+          type: approval
+
+      - init:
+          requires:
+            - approve-destroy
+
+      - destroy:
+          requires:
+            - init
