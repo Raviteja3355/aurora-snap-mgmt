@@ -1,0 +1,17 @@
+# tfvars temp cache — downloaded from S3 at runtime, deleted after apply/destroy
+.tfvars-cache/
+
+# Terragrunt cache
+**/.terragrunt-cache/
+
+# Terraform state and lock files
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
+# Lambda ZIP artifacts
+*.zip
+
+# Never ignore environment tfvars — CircleCI uploads them to S3
+!environments/*.tfvars

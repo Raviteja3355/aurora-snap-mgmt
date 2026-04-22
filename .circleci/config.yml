@@ -1,0 +1,212 @@
+version: 2.1
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PIPELINE PARAMETERS
+# When you trigger via "Run Pipeline" in the CircleCI UI, set `environment`
+# to the target env (e.g. qa, prod).  Defaults to "qa".
+# ──────────────────────────────────────────────────────────────────────────────
+parameters:
+  environment:
+    type: string
+    default: "qa"
+    description: "Target environment – must match a file in environments/<env>.tfvars"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EXECUTOR
+# alpine/terragrunt ships Terraform + Terragrunt on Alpine Linux.
+# Pin the tag to the Terragrunt version your team uses, e.g. alpine/terragrunt:0.58.14
+# ──────────────────────────────────────────────────────────────────────────────
+executors:
+  terragrunt:
+    docker:
+      - image: alpine/terragrunt:latest
+    working_directory: ~/project
+    environment:
+      TG_ENV: << pipeline.parameters.environment >>
+      AWS_DEFAULT_REGION: us-west-2
+
+# ──────────────────────────────────────────────────────────────────────────────
+# REUSABLE COMMANDS
+# ──────────────────────────────────────────────────────────────────────────────
+commands:
+  install_aws_cli:
+    description: "Install AWS CLI (not bundled in alpine/terragrunt)"
+    steps:
+      - run:
+          name: Install AWS CLI
+          command: apk add --no-cache aws-cli
+
+  verify_aws:
+    description: "Confirm AWS credentials are working"
+    steps:
+      - install_aws_cli
+      - run:
+          name: Verify AWS identity
+          command: aws sts get-caller-identity
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOBS
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # STAGE 1 · upload-tfvars
+  # Uploads environments/<env>.tfvars from the repo to the S3 config bucket.
+  # This job runs only after the "approve-upload-tfvars" manual gate is clicked.
+  # ────────────────────────────────────────────────────────────────────────────
+  upload-tfvars:
+    executor: terragrunt
+    steps:
+      - checkout
+      - verify_aws
+      - run:
+          name: "Upload << pipeline.parameters.environment >>.tfvars → S3"
+          command: |
+            ENV="<< pipeline.parameters.environment >>"
+            LOCAL="environments/${ENV}.tfvars"
+
+            # Read config_bucket and config_prefix directly from backend/backend.hcl
+            # so this step is always in sync with what terragrunt expects to find.
+            CONFIG_BUCKET=$(grep 'config_bucket' backend/backend.hcl | sed 's/.*=\s*"\(.*\)".*/\1/')
+            CONFIG_PREFIX=$(grep 'config_prefix' backend/backend.hcl | sed 's/.*=\s*"\(.*\)".*/\1/')
+            S3="s3://${CONFIG_BUCKET}/${CONFIG_PREFIX}/${ENV}.tfvars"
+
+            if [ ! -f "${LOCAL}" ]; then
+              echo "ERROR: ${LOCAL} not found in repo. Commit it before pushing."
+              exit 1
+            fi
+
+            echo "Config bucket  : ${CONFIG_BUCKET}"
+            echo "Uploading      : ${LOCAL} → ${S3}"
+            aws s3 cp "${LOCAL}" "${S3}" --sse aws:kms
+            echo "Upload complete."
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # STAGE 2 · init
+  # Initialises Terragrunt/Terraform and caches providers + modules.
+  # The .terragrunt-cache directory is persisted to the workspace so later
+  # jobs skip the provider download.
+  # ────────────────────────────────────────────────────────────────────────────
+  init:
+    executor: terragrunt
+    steps:
+      - checkout
+      - verify_aws
+      - run:
+          name: Terragrunt Init
+          command: |
+            mkdir -p .tfvars-cache
+            terragrunt init --terragrunt-non-interactive
+      - persist_to_workspace:
+          root: ~/project
+          paths:
+            - .terragrunt-cache
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # STAGE 3 · plan
+  # Runs terragrunt plan and saves the output as a build artifact so you can
+  # review it in the CircleCI UI before approving the apply gate.
+  # ────────────────────────────────────────────────────────────────────────────
+  plan:
+    executor: terragrunt
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/project
+      - verify_aws
+      - run:
+          name: Terragrunt Plan
+          command: |
+            mkdir -p .tfvars-cache
+            set -o pipefail
+            terragrunt plan \
+              --terragrunt-non-interactive \
+              2>&1 | tee /tmp/plan-output.txt
+            echo "──── Plan finished ────"
+      - store_artifacts:
+          path: /tmp/plan-output.txt
+          destination: plan-output.txt
+      - persist_to_workspace:
+          root: ~/project
+          paths:
+            - .terragrunt-cache
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # STAGE 4 · apply
+  # Runs only after the "approve-apply" manual gate is clicked.
+  # Review the plan-output.txt artifact from the plan job first!
+  # ────────────────────────────────────────────────────────────────────────────
+  apply:
+    executor: terragrunt
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/project
+      - verify_aws
+      - run:
+          name: Terragrunt Apply
+          command: |
+            mkdir -p .tfvars-cache
+            terragrunt apply \
+              --terragrunt-non-interactive \
+              -auto-approve
+      - run:
+          name: Apply complete – summarise outputs
+          command: terragrunt output --terragrunt-non-interactive || true
+          when: on_success
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WORKFLOW
+#
+# ┌─────────────────────────┐
+# │ 1. approve-upload-tfvars│  ← MANUAL GATE (click Approve in CircleCI)
+# └────────────┬────────────┘
+#              ▼
+# ┌─────────────────────────┐
+# │ 2. upload-tfvars        │  uploads environments/<env>.tfvars → S3
+# └────────────┬────────────┘
+#              ▼
+# ┌─────────────────────────┐
+# │ 3. init                 │  terragrunt init
+# └────────────┬────────────┘
+#              ▼
+# ┌─────────────────────────┐
+# │ 4. plan                 │  terragrunt plan  (artifact: plan-output.txt)
+# └────────────┬────────────┘
+#              ▼
+# ┌─────────────────────────┐
+# │ 5. approve-apply        │  ← MANUAL GATE (review plan artifact first!)
+# └────────────┬────────────┘
+#              ▼
+# ┌─────────────────────────┐
+# │ 6. apply                │  terragrunt apply -auto-approve
+# └─────────────────────────┘
+# ──────────────────────────────────────────────────────────────────────────────
+workflows:
+  deploy:
+    jobs:
+      # Gate 1 – approve before touching S3 tfvars
+      - approve-upload-tfvars:
+          type: approval
+
+      - upload-tfvars:
+          requires:
+            - approve-upload-tfvars
+
+      - init:
+          requires:
+            - upload-tfvars
+
+      - plan:
+          requires:
+            - init
+
+      # Gate 2 – approve after reviewing plan output artifact
+      - approve-apply:
+          type: approval
+          requires:
+            - plan
+
+      - apply:
+          requires:
+            - approve-apply
