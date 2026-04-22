@@ -24,6 +24,8 @@ executors:
     environment:
       TG_ENV: << pipeline.parameters.environment >>
       AWS_DEFAULT_REGION: ap-south-1
+      TERRAGRUNT_NON_INTERACTIVE: "true"
+      TF_INPUT: "false"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # REUSABLE COMMANDS
@@ -96,7 +98,7 @@ jobs:
           name: Terragrunt Init
           command: |
             mkdir -p .tfvars-cache
-            terragrunt init --terragrunt-non-interactive
+            terragrunt init
       - persist_to_workspace:
           root: ~/project
           paths:
@@ -119,9 +121,7 @@ jobs:
           command: |
             mkdir -p .tfvars-cache
             set -o pipefail
-            terragrunt plan \
-              --terragrunt-non-interactive \
-              2>&1 | tee /tmp/plan-output.txt
+            terragrunt plan 2>&1 | tee /tmp/plan-output.txt
             echo "──── Plan finished ────"
       - store_artifacts:
           path: /tmp/plan-output.txt
@@ -147,12 +147,10 @@ jobs:
           name: Terragrunt Apply
           command: |
             mkdir -p .tfvars-cache
-            terragrunt apply \
-              --terragrunt-non-interactive \
-              -auto-approve
+            terragrunt apply -auto-approve
       - run:
           name: Apply complete – summarise outputs
-          command: terragrunt output --terragrunt-non-interactive || true
+          command: terragrunt output || true
           when: on_success
 
 # ──────────────────────────────────────────────────────────────────────────────
